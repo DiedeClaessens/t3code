@@ -184,7 +184,7 @@ private extension UIColor {
   }
 }
 
-public final class T3TerminalView: ExpoView, UITextFieldDelegate {
+public final class T3TerminalView: ExpoView, UITextFieldDelegate, UIEditMenuInteractionDelegate, UIGestureRecognizerDelegate {
   private static let minimumVerticalScrollStepPoints: CGFloat = 18
   private static let verticalScrollStepMultiplier: CGFloat = 1.15
 
@@ -192,6 +192,8 @@ public final class T3TerminalView: ExpoView, UITextFieldDelegate {
   private let inputField = TerminalInputField()
   private let focusTapGesture = UITapGestureRecognizer()
   private let scrollPanGesture = UIPanGestureRecognizer()
+  private let selectionPressGesture = UILongPressGestureRecognizer()
+  private lazy var selectionMenu = UIEditMenuInteraction(delegate: self)
   private var lastViewportSize: CGSize = .zero
   private var lastContentScale: CGFloat = 0
   private var lastReportedGrid: (cols: Int, rows: Int)?
@@ -363,12 +365,16 @@ public final class T3TerminalView: ExpoView, UITextFieldDelegate {
       self?.emitInput(data)
     }
 
-    focusTapGesture.addTarget(self, action: #selector(handleViewportTap))
+    focusTapGesture.addTarget(self, action: #selector(handleViewportTap(_:)))
     terminalViewport.addGestureRecognizer(focusTapGesture)
     scrollPanGesture.addTarget(self, action: #selector(handleViewportPan(_:)))
     scrollPanGesture.maximumNumberOfTouches = 1
     scrollPanGesture.cancelsTouchesInView = false
     terminalViewport.addGestureRecognizer(scrollPanGesture)
+    selectionPressGesture.addTarget(self, action: #selector(handleViewportLongPress(_:)))
+    selectionPressGesture.delegate = self
+    terminalViewport.addGestureRecognizer(selectionPressGesture)
+    terminalViewport.addInteraction(selectionMenu)
 
     addSubview(terminalViewport)
     addSubview(inputField)
@@ -436,8 +442,86 @@ public final class T3TerminalView: ExpoView, UITextFieldDelegate {
   }
 
   @objc
-  private func handleViewportTap() {
-    requestKeyboardFocus()
+  private func handleViewportTap(_ gesture: UITapGestureRecognizer) {
+    guard let surface, ghostty_surface_has_selection(surface), !ghostty_surface_mouse_captured(surface) else {
+      requestKeyboardFocus()
+      return
+    }
+    clearSelection(surface, at: gesture.location(in: terminalViewport))
+  }
+
+  // libghostty has no clear-selection action; a plain click clears it.
+  private func clearSelection(_ surface: ghostty_surface_t, at location: CGPoint) {
+    sendSelectionMouse(surface, at: location, [GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RELEASE])
+    redrawSurface()
+  }
+
+  // A TUI that tracks the mouse owns clicks, so leave its input alone.
+  public override func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+    guard gestureRecognizer === selectionPressGesture else {
+      return super.gestureRecognizerShouldBegin(gestureRecognizer)
+    }
+    guard let surface else { return false }
+    return !ghostty_surface_mouse_captured(surface)
+  }
+
+  @objc
+  private func handleViewportLongPress(_ gesture: UILongPressGestureRecognizer) {
+    guard let surface else { return }
+    let location = gesture.location(in: terminalViewport)
+    switch gesture.state {
+    case .began:
+      // Press, release, press is a double click: it selects the word and the drag extends by words.
+      sendSelectionMouse(surface, at: location, [GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_RELEASE, GHOSTTY_MOUSE_PRESS])
+      UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+    case .changed:
+      sendSelectionMouse(surface, at: location, [])
+    default:
+      sendSelectionMouse(surface, at: location, [GHOSTTY_MOUSE_RELEASE])
+      if gesture.state == .ended, ghostty_surface_has_selection(surface) {
+        selectionMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: location))
+      }
+    }
+    redrawSurface()
+  }
+
+  private func sendSelectionMouse(_ surface: ghostty_surface_t, at location: CGPoint, _ states: [ghostty_input_mouse_state_e]) {
+    // libghostty scales points to pixels itself.
+    ghostty_surface_mouse_pos(surface, Double(location.x), Double(location.y), GHOSTTY_MODS_NONE)
+    for state in states {
+      _ = ghostty_surface_mouse_button(surface, state, GHOSTTY_MOUSE_LEFT, GHOSTTY_MODS_NONE)
+    }
+  }
+
+  public func editMenuInteraction(
+    _ interaction: UIEditMenuInteraction,
+    menuFor configuration: UIEditMenuConfiguration,
+    suggestedActions: [UIMenuElement]
+  ) -> UIMenu? {
+    UIMenu(children: [
+      UIAction(title: "Copy") { [weak self] _ in self?.copySelection(at: configuration.sourcePoint) },
+      UIAction(title: "Select All") { [weak self] _ in self?.selectAll(at: configuration.sourcePoint) },
+    ])
+  }
+
+  private func copySelection(at location: CGPoint) {
+    guard let surface else { return }
+    var selected = ghostty_text_s()
+    guard ghostty_surface_read_selection(surface, &selected) else { return }
+    if let pointer = selected.text, selected.text_len > 0 {
+      let bytes = UnsafeRawBufferPointer(start: pointer, count: Int(selected.text_len))
+      UIPasteboard.general.string = String(decoding: bytes, as: UTF8.self)
+    }
+    ghostty_surface_free_text(surface, &selected)
+    clearSelection(surface, at: location)
+  }
+
+  private func selectAll(at location: CGPoint) {
+    guard let surface else { return }
+    let action = "select_all"
+    _ = ghostty_surface_binding_action(surface, action, UInt(action.utf8.count))
+    redrawSurface()
+    selectionMenu.presentEditMenu(with: UIEditMenuConfiguration(identifier: nil, sourcePoint: location))
   }
 
   @objc
@@ -781,8 +865,8 @@ public final class T3TerminalView: ExpoView, UITextFieldDelegate {
   }
 
   private func writeThemeConfigFile() -> String? {
-    guard !themeConfig.isEmpty else { return nil }
-    let configContents = themeConfig
+    // Selection gestures send real clicks; click-to-move would turn them into arrow keys at a prompt.
+    let configContents = themeConfig + "cursor-click-to-move = false\n"
     let url = URL(fileURLWithPath: NSTemporaryDirectory())
       .appendingPathComponent("t3-terminal-theme-\(appearance.rawValue).ghostty")
 
